@@ -626,10 +626,53 @@ let selectedVidIds=new Set(),plCoverFile=null;
 let ctxTargetId=null,ctxTargetType='video',editCoverFile=null;
 
 // ══ DB ══
+// Stratégie de stockage hybride :
+// - Les BLOBS vidéo/audio/cover sont stockés dans l'Origin Private File System (OPFS)
+//   qui est persistant sur mobile (iOS Safari, Android Chrome) et supporte les gros fichiers
+// - Les MÉTADONNÉES (nom, catégorie, taille, etc.) restent dans IndexedDB
+// - Si OPFS non dispo (vieux navigateur), fallback sur IndexedDB pur
+
 let db;
+let opfsRoot = null;
+
+async function initOPFS(){
+  try{
+    opfsRoot = await navigator.storage.getDirectory();
+    return true;
+  }catch(e){
+    console.warn('OPFS non disponible, fallback IndexedDB',e);
+    opfsRoot = null;
+    return false;
+  }
+}
+
+async function opfsWrite(key, blob){
+  if(!opfsRoot) return null;
+  try{
+    const fh = await opfsRoot.getFileHandle(key, {create:true});
+    const writable = await fh.createWritable();
+    await writable.write(blob);
+    await writable.close();
+    return key;
+  }catch(e){ console.warn('OPFS write error',key,e); return null; }
+}
+
+async function opfsRead(key){
+  if(!opfsRoot||!key) return null;
+  try{
+    const fh = await opfsRoot.getFileHandle(key);
+    return await fh.getFile();
+  }catch(e){ return null; }
+}
+
+async function opfsDel(key){
+  if(!opfsRoot||!key) return;
+  try{ await opfsRoot.removeEntry(key); }catch(e){}
+}
+
 function initDB(){
   return new Promise((res,rej)=>{
-    const req=indexedDB.open('sharkflix',4);
+    const req=indexedDB.open('sharkflix',5);
     req.onupgradeneeded=e=>{
       const d=e.target.result;
       if(!d.objectStoreNames.contains('videos')) d.createObjectStore('videos',{keyPath:'id',autoIncrement:true});
@@ -641,11 +684,28 @@ function initDB(){
     req.onblocked=()=>rej(new Error('DB blocked'));
   });
 }
+
 const dbOp=(store,mode,op)=>new Promise((res,rej)=>{const tx=db.transaction(store,mode),s=tx.objectStore(store),r=op(s);r.onsuccess=()=>res(r.result);r.onerror=()=>rej(r.error);});
-const dbAdd=(rec)=>dbOp('videos','readwrite',s=>s.add(rec));
 const dbGetAll=()=>dbOp('videos','readonly',s=>s.getAll());
 const dbDel=(id)=>dbOp('videos','readwrite',s=>s.delete(id));
 const dbGet=(id)=>dbOp('videos','readonly',s=>s.get(id));
+
+// dbAdd : si OPFS dispo, stocke le blob dans OPFS et ne met que la clé en IDB
+async function dbAdd(rec){
+  let blobKey=null, coverKey=null;
+  if(opfsRoot){
+    const ts=Date.now()+'_'+Math.random().toString(36).slice(2);
+    if(rec.blob){ blobKey='v_'+ts; await opfsWrite(blobKey, rec.blob); }
+    if(rec.coverBlob){ coverKey='c_'+ts; await opfsWrite(coverKey, rec.coverBlob); }
+    const meta={name:rec.name,category:rec.category,size:rec.size,mediaType:rec.mediaType,
+      blobKey,coverKey,seriesId:rec.seriesId,seasonNum:rec.seasonNum,episodeNum:rec.episodeNum};
+    return dbOp('videos','readwrite',s=>s.add(meta));
+  } else {
+    // fallback: stocke tout en IDB
+    return dbOp('videos','readwrite',s=>s.add(rec));
+  }
+}
+
 function dbPutVideo(id,updates){
   return new Promise((res,rej)=>{
     const tx=db.transaction('videos','readwrite'),s=tx.objectStore('videos'),r=s.get(id);
@@ -670,11 +730,28 @@ const dbDelPl=(id)=>dbOp('playlists','readwrite',s=>s.delete(id));
 // ══ LOAD ══
 async function loadFromDB(){
   const [rows,serRows,plRows]=await Promise.all([dbGetAll(),dbGetAllSeries(),dbGetAllPl()]);
-  videos=rows.reverse().map(r=>({
-    id:r.id,name:r.name,category:r.category,size:r.size,mediaType:r.mediaType||'video',
-    url:URL.createObjectURL(r.blob),coverUrl:r.coverBlob?URL.createObjectURL(r.coverBlob):null,
-    seriesId:r.seriesId||null,seasonNum:r.seasonNum||null,episodeNum:r.episodeNum||null
+  // Charger les blobs depuis OPFS si disponible, sinon depuis IDB direct
+  const videoEntries=await Promise.all(rows.reverse().map(async r=>{
+    try{
+      let blob, coverBlob;
+      if(opfsRoot && r.blobKey){
+        // Mode OPFS : lire le fichier depuis le système de fichiers
+        blob = await opfsRead(r.blobKey);
+        if(r.coverKey) coverBlob = await opfsRead(r.coverKey);
+      } else if(r.blob instanceof Blob && r.blob.size>0){
+        // Mode fallback IDB
+        blob = r.blob;
+        coverBlob = r.coverBlob instanceof Blob ? r.coverBlob : null;
+      }
+      if(!blob){ dbDel(r.id).catch(()=>{}); return null; }
+      return {id:r.id,name:r.name,category:r.category,size:r.size,mediaType:r.mediaType||'video',
+        url:URL.createObjectURL(blob),
+        coverUrl:coverBlob?URL.createObjectURL(coverBlob):null,
+        seriesId:r.seriesId||null,seasonNum:r.seasonNum||null,episodeNum:r.episodeNum||null,
+        blobKey:r.blobKey||null,coverKey:r.coverKey||null};
+    }catch(err){ console.warn('Video entry skipped:',r.id,err); return null; }
   }));
+  videos=videoEntries.filter(Boolean);
   seriesList=serRows.reverse().map(r=>({
     id:r.id,name:r.name,
     coverUrl:r.coverBlob?URL.createObjectURL(r.coverBlob):null,
@@ -775,11 +852,21 @@ function proceedAdd(){
 }
 async function addVideo(f,category,coverFile){
   const mediaType=f.type.startsWith('audio/')?'audio':'video';
-  // f.blob est déjà un Blob stable cloné depuis le File original
-  const coverBlob=coverFile?coverFile.slice(0,coverFile.size,coverFile.type):null;
-  const record={name:cleanName(f.name),category,size:f.size,mediaType,blob:f.blob,coverBlob:coverBlob,seriesId:null,seasonNum:null,episodeNum:null};
+  // Lire en ArrayBuffer pour garantir un Blob natif stable
+  const arrayBuf=await f.blob.arrayBuffer();
+  const stableBlob=new Blob([arrayBuf],{type:f.type||'video/mp4'});
+  let coverBlob=null;
+  if(coverFile){
+    const cbuf=await coverFile.arrayBuffer();
+    coverBlob=new Blob([cbuf],{type:coverFile.type||'image/jpeg'});
+  }
+  // dbAdd gère lui-même OPFS vs IDB selon disponibilité
+  const record={name:cleanName(f.name),category,size:f.size,mediaType,blob:stableBlob,coverBlob,seriesId:null,seasonNum:null,episodeNum:null};
   const id=await dbAdd(record);
-  videos.unshift({id,name:record.name,category,size:f.size,mediaType,url:URL.createObjectURL(f.blob),coverUrl:coverBlob?URL.createObjectURL(coverBlob):null,seriesId:null,seasonNum:null,episodeNum:null});
+  videos.unshift({id,name:record.name,category,size:f.size,mediaType,
+    url:URL.createObjectURL(stableBlob),
+    coverUrl:coverBlob?URL.createObjectURL(coverBlob):null,
+    seriesId:null,seasonNum:null,episodeNum:null});
 }
 
 // ═══ SERIES WIZARD ═══
@@ -1018,9 +1105,14 @@ document.getElementById('wizSeasonCoverInput').addEventListener('change',functio
 
 // ══ VIDEO MGMT ══
 async function deleteVideo(id){
-  await dbDel(id);
   const v=videos.find(x=>x.id===id);
-  if(v){if(v.url)URL.revokeObjectURL(v.url);if(v.coverUrl)URL.revokeObjectURL(v.coverUrl)}
+  if(v){
+    if(v.url)URL.revokeObjectURL(v.url);
+    if(v.coverUrl)URL.revokeObjectURL(v.coverUrl);
+    if(v.blobKey)await opfsDel(v.blobKey);
+    if(v.coverKey)await opfsDel(v.coverKey);
+  }
+  await dbDel(id);
   videos=videos.filter(x=>x.id!==id);
   featuredIds=featuredIds.filter(x=>x!==id);saveFeatured();
   playlists.forEach(pl=>{pl.videoIds=pl.videoIds.filter(x=>x!==id)});
@@ -1789,7 +1881,8 @@ if('serviceWorker' in navigator){
 })();
 
 // ══ INIT ══
-initDB().then(()=>loadFromDB()).catch(e=>{console.error('DB:',e);render()});
+initOPFS().then(()=>initDB()).then(()=>loadFromDB()).catch(e=>{console.error('DB:',e);render()});
+
 </script>
 </body>
 </html>
